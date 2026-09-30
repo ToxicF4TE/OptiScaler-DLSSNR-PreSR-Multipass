@@ -119,7 +119,7 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
     }
 
     // Optional Ada unlock before NGX caches capabilities. External FG already returned above.
-    if (std::filesystem::path(normalizedPath).filename() == L"nvngx_dlssg.dll" && MfgUnlock::Pending())
+    if (std::filesystem::path(normalizedPath).filename() == L"nvngx_dlssg.dll" && MfgUnlock::Enabled())
     {
         auto snippet = NtdllProxy::LoadLibraryExW_Ldr(lpLibFullPath, NULL, 0);
         if (snippet)
@@ -136,6 +136,10 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 
         if (loadedBin && normalizedPath.contains(L"\\versions\\"))
         {
+            // The selected DLSSG provider may be an NGX cache image rather than the local DLL.
+            if (normalizedPath.contains(L"\\dlssg\\"))
+                MfgUnlock::TryApply(loadedBin);
+
             if (normalizedPath.contains(L"\\dlss\\"))
             {
                 State::Instance().NGX_OTA_Dlss = wstring_to_string(lpLibFullPath);

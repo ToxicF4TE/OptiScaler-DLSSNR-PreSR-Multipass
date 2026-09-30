@@ -332,64 +332,77 @@ unsigned int RewriteBlackwellKernels(HMODULE module)
 }
 } // namespace
 
-void MfgUnlock::TryApply(HMODULE requestedModule)
+bool MfgUnlock::Enabled()
 {
     if (!Config::Instance()->FGDLSSGAdaMfgUnlock.value_or_default() ||
         Config::Instance()->FGDLSSGAmpereMfgUnlock.value_or_default() || State::Instance().externalFrameGeneration)
-        return;
+        return false;
     const auto& gpu = IdentifyGpu::getPrimaryGpu();
     // The kernel retarget is Ada-specific. Do not patch Ampere/Turing or change Blackwell's working path.
-    if (gpu.vendorId != VendorId::Nvidia || gpu.nvidiaArchInfo.architecture_id != NV_GPU_ARCHITECTURE_AD100)
+    return gpu.vendorId == VendorId::Nvidia && gpu.nvidiaArchInfo.architecture_id == NV_GPU_ARCHITECTURE_AD100;
+}
+
+void MfgUnlock::TryApply(HMODULE requestedModule)
+{
+    if (!Enabled())
         return;
 
-    // Latches once nvngx_dlssg.dll is present; before that every call rescans for it.
-    static bool snippetDone = false;
+    auto module = requestedModule ? requestedModule : GetModuleHandleW(L"nvngx_dlssg.dll");
+    if (module == nullptr)
+        return;
 
-    if (!snippetDone)
+    // NGX can probe a local DLL before selecting a different cached provider. Track each image,
+    // while allowing an explicit load notification to recognise a reload at a previously used base.
+    static std::vector<HMODULE> triedModules;
+    const bool seen = std::find(triedModules.begin(), triedModules.end(), module) != triedModules.end();
+    if (seen && requestedModule == nullptr)
+        return;
+
+    // Patched gates no longer match. Unknown probes must not erase a supported provider's status.
+    const bool knownGates =
+        (UniqueAddress(module, kAdvertisePattern309) && UniqueAddress(module, kValidatePattern309)) ||
+        (UniqueAddress(module, kAdvertisePattern) && UniqueAddress(module, kValidatePattern));
+    if (seen && !knownGates)
+        return;
+    if (!seen)
+        triedModules.push_back(module);
+    if (!knownGates)
     {
-        if (auto module = requestedModule ? requestedModule : GetModuleHandleW(L"nvngx_dlssg.dll"); module != nullptr)
-        {
-            snippetDone = true;
-            g_status.ModuleFound = true;
-            g_status.SnippetVersion = ModuleVersion(module);
-
-            // Validate both gates before touching either. Ambiguous/unknown versions remain unmodified.
-            const bool knownGates =
-                (UniqueAddress(module, kAdvertisePattern309) && UniqueAddress(module, kValidatePattern309)) ||
-                (UniqueAddress(module, kAdvertisePattern) && UniqueAddress(module, kValidatePattern));
-            if (!knownGates)
-            {
-                LOG_WARN("MFG unlock: unsupported or ambiguous DLSSG {} signatures; left unchanged",
-                         g_status.SnippetVersion);
-                return;
-            }
-
-            // Default on where it applies: below Blackwell the unlock alone produces frames that do
-            // not advance the picture, so the two belong together. dlssCapable is set from the same
-            // field, so an architecture that never reported leaves this off.
-            const bool preBlackwell = gpu.vendorId == VendorId::Nvidia &&
-                                      gpu.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100 &&
-                                      gpu.nvidiaArchInfo.architecture_id <= NV_GPU_ARCHITECTURE_AD100;
-
-            if (Config::Instance()->FGDLSSGAdaBlackwellKernels.value_or(preBlackwell))
-                g_status.KernelsRewritten = RewriteBlackwellKernels(module);
-
-            if (g_status.KernelsRewritten == 0)
-            {
-                LOG_WARN("MFG unlock: no compatible interpolation kernels; frame-count gates left unchanged");
-                return;
-            }
-            const bool advertise = PatchAdvertise(module);
-            const bool validate = PatchValidate(module);
-            g_status.AdvertiseMatched = advertise;
-            g_status.ValidateMatched = validate;
-
-            if (advertise && validate)
-                LOG_INFO("MFG unlock: nvngx_dlssg.dll patched for {} generated frames", kMaxGeneratedFrames);
-            else
-                LOG_WARN("MFG unlock: nvngx_dlssg.dll incomplete, advertise {}, validate {}", advertise, validate);
-        }
+        LOG_WARN("MFG unlock: unsupported or ambiguous DLSSG {} signatures; left unchanged", ModuleVersion(module));
+        return;
     }
+
+    g_status.ModuleFound = true;
+    g_status.SnippetVersion = ModuleVersion(module);
+    g_status.AdvertiseMatched = false;
+    g_status.ValidateMatched = false;
+    g_status.KernelsRewritten = 0;
+
+    // Default on where it applies: below Blackwell the unlock alone produces frames that do
+    // not advance the picture, so the two belong together. dlssCapable is set from the same
+    // field, so an architecture that never reported leaves this off.
+    const auto& gpu = IdentifyGpu::getPrimaryGpu();
+    const bool preBlackwell = gpu.vendorId == VendorId::Nvidia &&
+                              gpu.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100 &&
+                              gpu.nvidiaArchInfo.architecture_id <= NV_GPU_ARCHITECTURE_AD100;
+
+    if (Config::Instance()->FGDLSSGAdaBlackwellKernels.value_or(preBlackwell))
+        g_status.KernelsRewritten = RewriteBlackwellKernels(module);
+
+    if (g_status.KernelsRewritten == 0)
+    {
+        LOG_WARN("MFG unlock: no compatible interpolation kernels; frame-count gates left unchanged");
+        return;
+    }
+    const bool advertise = PatchAdvertise(module);
+    const bool validate = PatchValidate(module);
+    g_status.AdvertiseMatched = advertise;
+    g_status.ValidateMatched = validate;
+
+    if (advertise && validate)
+        LOG_INFO("MFG unlock: nvngx_dlssg.dll patched for {} generated frames", kMaxGeneratedFrames);
+    else
+        LOG_WARN("MFG unlock: nvngx_dlssg.dll incomplete, advertise {}, validate {}", advertise, validate);
 }
 
 unsigned int MfgUnlock::UnlockedMax()
@@ -399,14 +412,6 @@ unsigned int MfgUnlock::UnlockedMax()
     return status.AdvertiseMatched && status.ValidateMatched && status.KernelsRewritten > 0 ? kMaxGeneratedFrames : 0;
 }
 
-bool MfgUnlock::Pending()
-{
-    if (!Config::Instance()->FGDLSSGAdaMfgUnlock.value_or_default() ||
-        Config::Instance()->FGDLSSGAmpereMfgUnlock.value_or_default() || State::Instance().externalFrameGeneration ||
-        g_status.ModuleFound)
-        return false;
-    const auto& gpu = IdentifyGpu::getPrimaryGpu();
-    return gpu.vendorId == VendorId::Nvidia && gpu.nvidiaArchInfo.architecture_id == NV_GPU_ARCHITECTURE_AD100;
-}
+bool MfgUnlock::Pending() { return Enabled() && !g_status.ModuleFound; }
 
 const MfgUnlock::Status& MfgUnlock::LastStatus() { return g_status; }

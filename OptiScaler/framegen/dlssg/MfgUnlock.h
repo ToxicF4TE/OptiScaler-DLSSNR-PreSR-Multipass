@@ -51,9 +51,11 @@ struct Status
 
 const Status& LastStatus();
 
-// Applies the patches once per process. Silent and harmless when the config option is off, when
-// nvngx_dlssg.dll is not loaded, or when a signature does not match exactly once.
+// Applies the patches per loaded provider. Explicit loader notifications also recognise reloads.
+// Silent and harmless when disabled, when no provider is loaded, or when signatures are not unique.
 void TryApply(HMODULE module = nullptr);
+// Eligibility is independent of whether an earlier provider has already been patched.
+bool Enabled();
 bool Pending();
 
 // The generated frame ceiling the patches opened, or 0 when they did not land.
