@@ -29,19 +29,67 @@ def body(source, signature):
 
 STUBS = r'''
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cwctype>
 #include <filesystem>
+#include <format>
+#include <functional>
+#include <future>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <utility>
 #include <vector>
+
+thread_local bool applyLockHeld = false;
+std::atomic<bool> boundaryViolation{false}, checkBoundaries{false}, pauseKernels{false};
+std::promise<void> kernelsPaused, resumeKernels;
+auto resumeSignal = resumeKernels.get_future().share();
+struct CheckedMutex {
+    std::mutex mutex;
+    std::atomic<unsigned> attempts{0};
+    void lock() { ++attempts; mutex.lock(); applyLockHeld = true; }
+    void unlock() { applyLockHeld = false; mutex.unlock(); }
+} g_mutex;
+void outsideApplyLock() {
+    if (checkBoundaries && applyLockHeld) boundaryViolation = true;
+}
+void insideApplyLock() {
+    if (checkBoundaries && !applyLockHeld) boundaryViolation = true;
+}
+// Pause exactly after the production kernel-count assignment, before its gate test.
+struct KernelCount {
+    unsigned value = 0;
+    operator unsigned() const { return value; }
+    KernelCount& operator=(unsigned count) {
+        value = count;
+        if (count == 31 && pauseKernels.exchange(false)) {
+            kernelsPaused.set_value();
+            resumeSignal.wait();
+        }
+        return *this;
+    }
+};
+std::function<void()> loggingCallback;
+namespace spdlog {
+namespace level { enum level_enum { info, warn }; }
+template<class... Args> void log(level::level_enum, Args&&...) {
+    outsideApplyLock();
+    // Record unsafe dispatch without hanging the negative-control process.
+    if (!applyLockHeld && loggingCallback) loggingCallback();
+}
+}
 
 struct FakeModule {
     bool supported = true, loaded = true, kernelCompatible = true;
     bool advertise = false, validate = false, advertiseWritable = true;
-    unsigned rewrites = 0;
+    bool kernelsRetargeted = false;
+    unsigned rewrites = 0, references = 0;
     std::string version = "310.9.1";
 };
 using HMODULE = FakeModule*;
@@ -70,12 +118,12 @@ struct GPU {
     struct { int architecture_id = NV_GPU_ARCHITECTURE_AD100; } nvidiaArchInfo;
 };
 GPU gpu;
-const GPU& getPrimaryGpu() { return gpu; }
+const GPU& getPrimaryGpu() { outsideApplyLock(); return gpu; }
 }
 namespace MfgUnlock {
 struct Status {
     bool ModuleFound = false, AdvertiseMatched = false, ValidateMatched = false;
-    unsigned KernelsRewritten = 0;
+    KernelCount KernelsRewritten;
     std::string SnippetVersion;
 };
 void TryApply(HMODULE = nullptr);
@@ -87,7 +135,21 @@ const Status& LastStatus();
 MfgUnlock::Status g_status;
 HMODULE current = nullptr, nextLoaded = nullptr;
 unsigned loaderCalls = 0;
-HMODULE GetModuleHandleW(const wchar_t*) { return current && current->loaded ? current : nullptr; }
+unsigned referenceAcquires = 0, referenceReleases = 0, versionReads = 0;
+HMODULE GetModuleHandleW(const wchar_t*) {
+    outsideApplyLock(); return current && current->loaded ? current : nullptr;
+}
+bool GetModuleHandleExW(unsigned, const wchar_t*, HMODULE* module) {
+    outsideApplyLock();
+    *module = GetModuleHandleW(nullptr);
+    if (!*module) return false;
+    ++(*module)->references; ++referenceAcquires;
+    return true;
+}
+bool FreeLibrary(HMODULE module) {
+    outsideApplyLock(); --module->references; ++referenceReleases;
+    return true;
+}
 namespace NtdllProxy {
 HMODULE LoadLibraryExW_Ldr(const wchar_t*, void*, int) {
     ++loaderCalls;
@@ -100,26 +162,43 @@ constexpr std::string_view kValidatePattern309 = "validate";
 constexpr std::string_view kAdvertisePattern = "legacyAdvertise";
 constexpr std::string_view kValidatePattern = "legacyValidate";
 uintptr_t UniqueAddress(HMODULE module, std::string_view pattern) {
+    insideApplyLock();
     if (!module->supported || !module->loaded) return 0;
     if (pattern == kAdvertisePattern309) return !module->advertise;
     if (pattern == kValidatePattern309) return !module->validate;
     return 0;
 }
-std::string ModuleVersion(HMODULE module) { return module->version; }
-unsigned RewriteBlackwellKernels(HMODULE module) {
-    ++module->rewrites;
-    return module->kernelCompatible ? 31 : 0;
+std::string ModuleVersion(HMODULE module) {
+    outsideApplyLock(); ++versionReads; return module->version;
 }
-bool PatchAdvertise(HMODULE module) { return module->advertise = module->advertiseWritable; }
-bool PatchValidate(HMODULE module) { return module->validate = true; }
+// The production diagnostic/reference helpers are inserted here.
+/* PATCH_HELPERS */
+template<class... Logs> unsigned RewriteBlackwellKernels(HMODULE module, Logs&... logs) {
+    insideApplyLock();
+    ++module->rewrites;
+    const bool canRewrite = module->kernelCompatible && !module->kernelsRetargeted;
+    module->kernelsRetargeted |= canRewrite;
+    (logs.Add(spdlog::level::info, "RewriteBlackwellKernels", "kernels {}", canRewrite), ...);
+    return canRewrite ? 31 : 0;
+}
+template<class... Logs> bool PatchAdvertise(HMODULE module, Logs&... logs) {
+    insideApplyLock();
+    (logs.Add(spdlog::level::info, "PatchAdvertise", "advertise"), ...);
+    return module->advertise = module->advertiseWritable;
+}
+template<class... Logs> bool PatchValidate(HMODULE module, Logs&... logs) {
+    insideApplyLock();
+    (logs.Add(spdlog::level::info, "PatchValidate", "validate"), ...);
+    return module->validate = true;
+}
 std::string wstring_to_string(const wchar_t* path) {
     std::wstring wide(path);
     std::string narrow;
     for (wchar_t character : wide) narrow.push_back(static_cast<char>(character));
     return narrow;
 }
-#define LOG_INFO(...) ((void)0)
-#define LOG_WARN(...) ((void)0)
+#define LOG_INFO(...) spdlog::log(spdlog::level::info, __VA_ARGS__)
+#define LOG_WARN(...) spdlog::log(spdlog::level::warn, __VA_ARGS__)
 '''
 
 CASES = r'''
@@ -136,7 +215,71 @@ int main(int argc, char** argv) {
     unknown.supported = false;
     const std::wstring dll = L"C:\\game\\nvngx_dlssg.dll";
     const std::wstring bin = L"C:\\ProgramData\\NVIDIA\\NGX\\models\\dlssg\\versions\\20318464\\files\\160_e658700.bin";
-    if (name == "local_then_cached") {
+    if (name.starts_with("concurrent_")) {
+        checkBoundaries = true;
+        pauseKernels = true;
+        auto paused = kernelsPaused.get_future();
+        std::thread writer([&] { MfgUnlock::TryApply(&local); });
+        const bool writerPaused = paused.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        const unsigned before = g_mutex.attempts;
+        std::promise<void> readerDone;
+        auto done = readerDone.get_future();
+        bool readerGood = false;
+        std::thread reader([&] {
+            if (name == "concurrent_provider_notifications") {
+                MfgUnlock::TryApply(&local); readerGood = true;
+            } else if (name == "concurrent_status_snapshot") {
+                const auto status = MfgUnlock::LastStatus();
+                readerGood = status.AdvertiseMatched && status.ValidateMatched && status.KernelsRewritten == 31;
+            } else if (name == "concurrent_unlocked_max") {
+                readerGood = MfgUnlock::UnlockedMax() == 5;
+            } else if (name == "concurrent_pending") {
+                readerGood = !MfgUnlock::Pending();
+            }
+            readerDone.set_value();
+        });
+        // Observe either the contender's actual mutex acquisition attempt or an
+        // unprotected return. No scheduling assumption or stress-only oracle.
+        for (unsigned i = 0; i < 2000 && g_mutex.attempts == before &&
+                done.wait_for(std::chrono::seconds(0)) != std::future_status::ready; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool readerBlocked = g_mutex.attempts > before;
+        resumeKernels.set_value();
+        writer.join(); reader.join();
+        CHECK(writerPaused && readerBlocked && readerGood && !boundaryViolation);
+        CHECK(unlocked(local) && MfgUnlock::UnlockedMax() == 5);
+    } else if (name == "stable_status_snapshot") {
+        local.version = std::string(96, 'L'); cached.version = std::string(96, 'C');
+        Load(dll, &local);
+        const auto& previous = MfgUnlock::LastStatus();
+        Load(bin, &cached);
+        CHECK(previous.SnippetVersion == local.version && previous.AdvertiseMatched);
+        CHECK(MfgUnlock::LastStatus().SnippetVersion == cached.version);
+    } else if (name == "metadata_outside_lock") {
+        checkBoundaries = true;
+        Load(dll, &local);
+        CHECK(unlocked(local) && !boundaryViolation);
+    } else if (name == "logging_reentry") {
+        checkBoundaries = true;
+        unsigned callbacks = 0;
+        bool complete = true;
+        loggingCallback = [&] {
+            ++callbacks;
+            const auto status = MfgUnlock::LastStatus();
+            complete &= status.AdvertiseMatched && status.ValidateMatched && status.KernelsRewritten == 31;
+            MfgUnlock::TryApply(&local);
+        };
+        Load(dll, &local);
+        CHECK(callbacks > 0 && complete && !boundaryViolation && unlocked(local));
+    } else if (name == "polled_module_reference") {
+        checkBoundaries = true;
+        current = &local;
+        MfgUnlock::TryApply();
+        const unsigned reads = versionReads;
+        MfgUnlock::TryApply();
+        CHECK(unlocked(local) && !boundaryViolation && local.references == 0);
+        CHECK(referenceAcquires == 2 && referenceReleases == 2 && versionReads == reads);
+    } else if (name == "local_then_cached") {
         Load(dll, &local); CHECK(unlocked(local)); CHECK(!MfgUnlock::Pending());
         local.loaded = false;
         Load(bin, &cached); CHECK(unlocked(cached));
@@ -215,6 +358,9 @@ SCENARIOS = (
     "unsupported_address_reused", "incompatible_kernels", "kernels_disabled_after_success",
     "partial_gate_failure", "unlock_disabled", "ampere_unlock_selected", "external_fg",
     "non_ada", "non_nvidia", "absent_provider", "normalized_cache_path", "other_ota_features",
+    "concurrent_provider_notifications", "concurrent_status_snapshot", "concurrent_unlocked_max",
+    "concurrent_pending", "stable_status_snapshot", "metadata_outside_lock", "logging_reentry",
+    "polled_module_reference",
 )
 
 
@@ -226,11 +372,21 @@ def main():
     args = parser.parse_args()
     unlock = (args.source_root / "OptiScaler/framegen/dlssg/MfgUnlock.cpp").read_text(encoding="utf-8-sig")
     hook = (args.source_root / "OptiScaler/hooks/LibraryLoad_Hooks.cpp").read_text(encoding="utf-8-sig")
-    code = STUBS + "\n"
+    helpers = ""
+    for signature in ("struct PatchLogs", "struct ModuleReference"):
+        if signature in unlock:
+            helpers += body(unlock, signature) + ";\n"
+    code = STUBS.replace("/* PATCH_HELPERS */", helpers) + "\n"
+    if "MfgUnlock::Status MfgUnlock::LastStatus()" in unlock:
+        code = code.replace("const Status& LastStatus();", "Status LastStatus();")
     for signature in ("bool MfgUnlock::Enabled()", "void MfgUnlock::TryApply(",
                       "bool MfgUnlock::Pending()", "unsigned int MfgUnlock::UnlockedMax()",
-                      "const MfgUnlock::Status& MfgUnlock::LastStatus()"):
+                      "const MfgUnlock::Status& MfgUnlock::LastStatus()",
+                      "MfgUnlock::Status MfgUnlock::LastStatus()"):
         if signature in unlock:
+            if signature == "MfgUnlock::Status MfgUnlock::LastStatus()" and \
+                    "const MfgUnlock::Status& MfgUnlock::LastStatus()" in unlock:
+                continue
             code += body(unlock, signature) + "\n"
     # These are the actual loader branches, including their eligibility checks.
     code += r'''
@@ -257,7 +413,7 @@ HMODULE Load(std::wstring libName, HMODULE module) {
         subprocess.run(command, cwd=directory, check=True)
         failures = []
         for case in args.case or SCENARIOS:
-            if subprocess.run([str(exe), case], cwd=directory).returncode:
+            if subprocess.run([str(exe), case], cwd=directory, timeout=15).returncode:
                 failures.append(case)
         if failures:
             raise SystemExit("Failed scenarios: " + ", ".join(failures))

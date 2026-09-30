@@ -49,7 +49,8 @@ struct Status
     std::string SnippetVersion; // file version of nvngx_dlssg.dll, empty if it could not be read
 };
 
-const Status& LastStatus();
+// A stable copy; a later provider attempt cannot mutate a caller's view.
+Status LastStatus();
 
 // Applies the patches per loaded provider. Explicit loader notifications also recognise reloads.
 // Silent and harmless when disabled, when no provider is loaded, or when signatures are not unique.

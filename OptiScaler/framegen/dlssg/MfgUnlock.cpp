@@ -9,6 +9,9 @@
 #include <scanner/scanner.h>
 #include <misc/IdentifyGpu.h>
 
+#include <mutex>
+#include <utility>
+
 namespace
 {
 // mov ebx,1 / mov r8d,3 / cmp edi,0x1b0 / cmovl r8d,ebx. The two counts and the architecture
@@ -72,6 +75,38 @@ uintptr_t FindDataBytes(HMODULE module, const uint8_t* needle, size_t length)
 }
 
 MfgUnlock::Status g_status {};
+std::mutex g_mutex;
+
+// A synchronous NGX logging callback can re-enter the loader or query our status.
+// Capture diagnostics while patching and deliver them only after releasing g_mutex.
+struct PatchLogs
+{
+    std::vector<std::pair<spdlog::level::level_enum, std::string>> messages;
+
+    template <typename... Args>
+    void Add(spdlog::level::level_enum level, const char* function, std::format_string<Args...> format, Args&&... args)
+    {
+        messages.emplace_back(level, std::format("{} {}", function, std::format(format, std::forward<Args>(args)...)));
+    }
+
+    void Flush() const
+    {
+        for (const auto& [level, message] : messages)
+            spdlog::log(level, "{}", message);
+    }
+};
+
+// Polling must retain the image while waiting for an apply transaction. Loader
+// notifications already own their load reference. Release outside g_mutex.
+struct ModuleReference
+{
+    HMODULE module = nullptr;
+    ~ModuleReference()
+    {
+        if (module)
+            FreeLibrary(module);
+    }
+};
 
 uintptr_t UniqueAddress(HMODULE module, std::string_view pattern)
 {
@@ -97,13 +132,13 @@ std::string ModuleVersion(HMODULE module)
     return std::format("{}.{}.{}", file.major, file.minor, file.patch);
 }
 
-bool WriteBytes(uintptr_t address, const uint8_t* bytes, size_t count)
+bool WriteBytes(uintptr_t address, const uint8_t* bytes, size_t count, PatchLogs& logs)
 {
     DWORD oldProtect = 0;
 
     if (!VirtualProtect((LPVOID) address, count, PAGE_EXECUTE_READWRITE, &oldProtect))
     {
-        LOG_WARN("VirtualProtect failed at {:X}", address);
+        logs.Add(spdlog::level::warn, __FUNCTION__, "VirtualProtect failed at {:X}", address);
         return false;
     }
 
@@ -127,7 +162,7 @@ std::string Hex(const uint8_t* bytes, size_t count)
 }
 
 // Rewrites count and neutralises the architecture clamp, so MultiFrameCountMax is published as five.
-bool PatchAdvertise(HMODULE module)
+bool PatchAdvertise(HMODULE module, PatchLogs& logs)
 {
     if (const auto at309 = UniqueAddress(module, kAdvertisePattern309); at309 != 0)
     {
@@ -135,17 +170,18 @@ bool PatchAdvertise(HMODULE module)
         const auto branchAt = at309 + 6;
         const uint8_t nop[] = { 0x0F, 0x1F, 0x44, 0x00, 0x00, 0x90 };
 
-        LOG_INFO("MFG unlock: advertise (310.9) at {:X}, jl {} -> {}", at309,
+        logs.Add(spdlog::level::info, __FUNCTION__, "MFG unlock: advertise (310.9) at {:X}, jl {} -> {}", at309,
                  Hex((const uint8_t*) branchAt, sizeof(nop)), Hex(nop, sizeof(nop)));
 
-        return WriteBytes(branchAt, nop, sizeof(nop));
+        return WriteBytes(branchAt, nop, sizeof(nop), logs);
     }
 
     const auto address = UniqueAddress(module, kAdvertisePattern);
 
     if (address == 0)
     {
-        LOG_WARN("MFG unlock: the advertise signature did not match, nvngx_dlssg.dll left alone");
+        logs.Add(spdlog::level::warn, __FUNCTION__,
+                 "MFG unlock: the advertise signature did not match, nvngx_dlssg.dll left alone");
         return false;
     }
 
@@ -156,14 +192,15 @@ bool PatchAdvertise(HMODULE module)
     const uint8_t count[] = { kMaxGeneratedFrames };
     const uint8_t nop[] = { 0x0F, 0x1F, 0x40, 0x00 };
 
-    LOG_INFO("MFG unlock: advertise at {:X}, count {} -> {}, cmovl {} -> {}", address, *(const uint8_t*) countAt,
-             kMaxGeneratedFrames, Hex((const uint8_t*) cmovAt, sizeof(nop)), Hex(nop, sizeof(nop)));
+    logs.Add(spdlog::level::info, __FUNCTION__, "MFG unlock: advertise at {:X}, count {} -> {}, cmovl {} -> {}",
+             address, *(const uint8_t*) countAt, kMaxGeneratedFrames, Hex((const uint8_t*) cmovAt, sizeof(nop)),
+             Hex(nop, sizeof(nop)));
 
-    return WriteBytes(countAt, count, sizeof(count)) && WriteBytes(cmovAt, nop, sizeof(nop));
+    return WriteBytes(countAt, count, sizeof(count), logs) && WriteBytes(cmovAt, nop, sizeof(nop), logs);
 }
 
 // Drops the Ada branch and raises the accepted count, so a request for five is not rejected.
-bool PatchValidate(HMODULE module)
+bool PatchValidate(HMODULE module, PatchLogs& logs)
 {
     if (const auto at309 = UniqueAddress(module, kValidatePattern309); at309 != 0)
     {
@@ -171,17 +208,18 @@ bool PatchValidate(HMODULE module)
         const auto setAt = at309 + 5;
         const uint8_t always[] = { 0xB0, 0x01, 0x90 };
 
-        LOG_INFO("MFG unlock: validate (310.9) at {:X}, setae {} -> {}", at309,
+        logs.Add(spdlog::level::info, __FUNCTION__, "MFG unlock: validate (310.9) at {:X}, setae {} -> {}", at309,
                  Hex((const uint8_t*) setAt, sizeof(always)), Hex(always, sizeof(always)));
 
-        return WriteBytes(setAt, always, sizeof(always));
+        return WriteBytes(setAt, always, sizeof(always), logs);
     }
 
     const auto address = UniqueAddress(module, kValidatePattern);
 
     if (address == 0)
     {
-        LOG_WARN("MFG unlock: the validate signature did not match, nvngx_dlssg.dll left alone");
+        logs.Add(spdlog::level::warn, __FUNCTION__,
+                 "MFG unlock: the validate signature did not match, nvngx_dlssg.dll left alone");
         return false;
     }
 
@@ -192,11 +230,11 @@ bool PatchValidate(HMODULE module)
     const uint8_t nop[] = { 0x90, 0x90 };
     const uint8_t count[] = { kMaxGeneratedFrames };
 
-    LOG_INFO("MFG unlock: validate at {:X}, jl {} -> {}, count {} -> {}", address,
+    logs.Add(spdlog::level::info, __FUNCTION__, "MFG unlock: validate at {:X}, jl {} -> {}, count {} -> {}", address,
              Hex((const uint8_t*) branchAt, sizeof(nop)), Hex(nop, sizeof(nop)), *(const uint8_t*) countAt,
              kMaxGeneratedFrames);
 
-    return WriteBytes(branchAt, nop, sizeof(nop)) && WriteBytes(countAt, count, sizeof(count));
+    return WriteBytes(branchAt, nop, sizeof(nop), logs) && WriteBytes(countAt, count, sizeof(count), logs);
 }
 
 // Gives Ada the Blackwell kernels the module already carries.
@@ -225,7 +263,7 @@ constexpr uint32_t kArchParked = 122;
 constexpr size_t kImagePayloadSize = 8;
 constexpr size_t kImageArch = 28;
 
-unsigned int RewriteBlackwellKernels(HMODULE module)
+unsigned int RewriteBlackwellKernels(HMODULE module, PatchLogs& logs)
 {
     auto base = reinterpret_cast<uint8_t*>(module);
     auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
@@ -321,12 +359,13 @@ unsigned int RewriteBlackwellKernels(HMODULE module)
             std::memcpy(patched.data() + (blackwell + kImageArch - c), &ada89, sizeof(ada89));
             for (uint8_t* image : ada)
                 std::memcpy(patched.data() + (image + kImageArch - c), &parked, sizeof(parked));
-            if (WriteBytes(reinterpret_cast<uintptr_t>(c), patched.data(), patched.size()))
+            if (WriteBytes(reinterpret_cast<uintptr_t>(c), patched.data(), patched.size(), logs))
                 ++rewritten;
         }
     }
 
-    LOG_INFO("MFG unlock: {} kernel containers answer Ada with the Blackwell image", rewritten);
+    logs.Add(spdlog::level::info, __FUNCTION__, "MFG unlock: {} kernel containers answer Ada with the Blackwell image",
+             rewritten);
 
     return rewritten;
 }
@@ -347,13 +386,35 @@ void MfgUnlock::TryApply(HMODULE requestedModule)
     if (!Enabled())
         return;
 
-    auto module = requestedModule ? requestedModule : GetModuleHandleW(L"nvngx_dlssg.dll");
-    if (module == nullptr)
-        return;
+    ModuleReference reference;
+    auto module = requestedModule;
+    if (!module)
+    {
+        if (!GetModuleHandleExW(0, L"nvngx_dlssg.dll", &reference.module))
+            return;
+        module = reference.module;
+    }
 
     // NGX can probe a local DLL before selecting a different cached provider. Track each image,
     // while allowing an explicit load notification to recognise a reload at a previously used base.
     static std::vector<HMODULE> triedModules;
+    {
+        std::lock_guard lock(g_mutex);
+        if (!requestedModule && std::find(triedModules.begin(), triedModules.end(), module) != triedModules.end())
+            return;
+    }
+
+    // These can take the loader/GPU locks. Never hold our transaction mutex around them.
+    const auto version = ModuleVersion(module);
+    const auto& gpu = IdentifyGpu::getPrimaryGpu();
+    const bool preBlackwell = gpu.vendorId == VendorId::Nvidia &&
+                              gpu.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100 &&
+                              gpu.nvidiaArchInfo.architecture_id <= NV_GPU_ARCHITECTURE_AD100;
+    const bool rewriteKernels = Config::Instance()->FGDLSSGAdaBlackwellKernels.value_or(preBlackwell);
+
+    PatchLogs logs;
+    std::unique_lock lock(g_mutex);
+    // Recheck after metadata retrieval: another thread may have completed this image.
     const bool seen = std::find(triedModules.begin(), triedModules.end(), module) != triedModules.end();
     if (seen && requestedModule == nullptr)
         return;
@@ -368,50 +429,60 @@ void MfgUnlock::TryApply(HMODULE requestedModule)
         triedModules.push_back(module);
     if (!knownGates)
     {
-        LOG_WARN("MFG unlock: unsupported or ambiguous DLSSG {} signatures; left unchanged", ModuleVersion(module));
-        return;
+        logs.Add(spdlog::level::warn, __FUNCTION__,
+                 "MFG unlock: unsupported or ambiguous DLSSG {} signatures; left unchanged", version);
     }
-
-    g_status.ModuleFound = true;
-    g_status.SnippetVersion = ModuleVersion(module);
-    g_status.AdvertiseMatched = false;
-    g_status.ValidateMatched = false;
-    g_status.KernelsRewritten = 0;
-
-    // Default on where it applies: below Blackwell the unlock alone produces frames that do
-    // not advance the picture, so the two belong together. dlssCapable is set from the same
-    // field, so an architecture that never reported leaves this off.
-    const auto& gpu = IdentifyGpu::getPrimaryGpu();
-    const bool preBlackwell = gpu.vendorId == VendorId::Nvidia &&
-                              gpu.nvidiaArchInfo.architecture_id >= NV_GPU_ARCHITECTURE_TU100 &&
-                              gpu.nvidiaArchInfo.architecture_id <= NV_GPU_ARCHITECTURE_AD100;
-
-    if (Config::Instance()->FGDLSSGAdaBlackwellKernels.value_or(preBlackwell))
-        g_status.KernelsRewritten = RewriteBlackwellKernels(module);
-
-    if (g_status.KernelsRewritten == 0)
-    {
-        LOG_WARN("MFG unlock: no compatible interpolation kernels; frame-count gates left unchanged");
-        return;
-    }
-    const bool advertise = PatchAdvertise(module);
-    const bool validate = PatchValidate(module);
-    g_status.AdvertiseMatched = advertise;
-    g_status.ValidateMatched = validate;
-
-    if (advertise && validate)
-        LOG_INFO("MFG unlock: nvngx_dlssg.dll patched for {} generated frames", kMaxGeneratedFrames);
     else
-        LOG_WARN("MFG unlock: nvngx_dlssg.dll incomplete, advertise {}, validate {}", advertise, validate);
+    {
+        Status status {};
+        status.ModuleFound = true;
+        status.SnippetVersion = version;
+
+        // On Ada the unlock and compatible interpolation kernels belong together.
+        if (rewriteKernels)
+            status.KernelsRewritten = RewriteBlackwellKernels(module, logs);
+
+        if (status.KernelsRewritten == 0)
+        {
+            logs.Add(spdlog::level::warn, __FUNCTION__,
+                     "MFG unlock: no compatible interpolation kernels; frame-count gates left unchanged");
+        }
+        else
+        {
+            status.AdvertiseMatched = PatchAdvertise(module, logs);
+            status.ValidateMatched = PatchValidate(module, logs);
+
+            if (status.AdvertiseMatched && status.ValidateMatched)
+                logs.Add(spdlog::level::info, __FUNCTION__,
+                         "MFG unlock: nvngx_dlssg.dll patched for {} generated frames", kMaxGeneratedFrames);
+            else
+                logs.Add(spdlog::level::warn, __FUNCTION__,
+                         "MFG unlock: nvngx_dlssg.dll incomplete, advertise {}, validate {}", status.AdvertiseMatched,
+                         status.ValidateMatched);
+        }
+        g_status = std::move(status);
+    }
+    lock.unlock();
+    logs.Flush();
 }
 
 unsigned int MfgUnlock::UnlockedMax()
 {
-    const auto& status = LastStatus();
-
-    return status.AdvertiseMatched && status.ValidateMatched && status.KernelsRewritten > 0 ? kMaxGeneratedFrames : 0;
+    std::lock_guard lock(g_mutex);
+    return g_status.AdvertiseMatched && g_status.ValidateMatched && g_status.KernelsRewritten > 0 ? kMaxGeneratedFrames
+                                                                                                  : 0;
 }
 
-bool MfgUnlock::Pending() { return Enabled() && !g_status.ModuleFound; }
+bool MfgUnlock::Pending()
+{
+    if (!Enabled())
+        return false;
+    std::lock_guard lock(g_mutex);
+    return !g_status.ModuleFound;
+}
 
-const MfgUnlock::Status& MfgUnlock::LastStatus() { return g_status; }
+MfgUnlock::Status MfgUnlock::LastStatus()
+{
+    std::lock_guard lock(g_mutex);
+    return g_status;
+}
