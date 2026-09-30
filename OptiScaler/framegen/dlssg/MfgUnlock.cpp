@@ -211,13 +211,17 @@ void PatchPluginCeilings()
 
     for (HMODULE plugin : g_plugins)
     {
+        // NGX's requirements probe can unload a plugin before the real device
+        // starts. Never scan a stale module handle while unlocking another provider.
+        wchar_t path[MAX_PATH] {};
+        if (GetModuleFileNameW(plugin, path, MAX_PATH) == 0)
+            continue;
+
         if (std::find(g_pluginsTried.begin(), g_pluginsTried.end(), plugin) != g_pluginsTried.end())
             continue;
 
         g_pluginsTried.push_back(plugin);
 
-        wchar_t path[MAX_PATH] {};
-        GetModuleFileNameW(plugin, path, MAX_PATH);
         const auto pluginPath = wstring_to_string(path);
 
         // A plugin that was patched stays patched; a second one that cannot be does not change that.
@@ -502,31 +506,44 @@ void MfgUnlock::TryApply(HMODULE requestedModule)
 
     std::lock_guard lock(g_mutex);
 
-    // Latches once nvngx_dlssg.dll is present; before that every call rescans for it.
-    static bool snippetDone = false;
+    // NGX can probe the local provider, unload it, then use a different OTA provider.
+    // Each provider must be unlocked before NGX caches that provider's capabilities.
+    static std::vector<HMODULE> snippetsTried;
 
-    if (!snippetDone)
+    if (auto module = requestedModule ? requestedModule : FindProvider(); module != nullptr)
     {
-        if (auto module = requestedModule ? requestedModule : FindProvider(); module != nullptr)
+        const bool seen = std::find(snippetsTried.begin(), snippetsTried.end(), module) != snippetsTried.end();
+        if (seen && !requestedModule)
+            return;
+        const bool knownGates =
+            (UniqueAddress(module, kAdvertisePattern309) && UniqueAddress(module, kValidatePattern309)) ||
+            (UniqueAddress(module, kAdvertisePattern) && UniqueAddress(module, kValidatePattern));
+
+        // Ordinary Streamline calls must not rewrite an already patched provider. A load
+        // notification with original gates also covers a DLL reloaded at the same address.
+        if (seen && !knownGates)
+            return;
+
+        if (!seen)
+            snippetsTried.push_back(module);
+
+        // Driver requirements probes can also load older, unsupported providers.
+        // They must not erase the completed unlock for the effective OTA provider.
+        if (!knownGates)
         {
-            snippetDone = true;
+            LOG_WARN("MFG unlock: unsupported or ambiguous DLSSG {} signatures; left unchanged", ModuleVersion(module));
+            return;
+        }
+
+        {
             g_status.ModuleFound = true;
+            g_status.AdvertiseMatched = false;
+            g_status.ValidateMatched = false;
             g_status.SnippetVersion = ModuleVersion(module);
 
             wchar_t modulePath[MAX_PATH] {};
             GetModuleFileNameW(module, modulePath, MAX_PATH);
             LOG_INFO("MFG unlock: DLSS-G provider {} at {}", g_status.SnippetVersion, wstring_to_string(modulePath));
-
-            // Validate both gates before touching either. Ambiguous/unknown versions remain unmodified.
-            const bool knownGates =
-                (UniqueAddress(module, kAdvertisePattern309) && UniqueAddress(module, kValidatePattern309)) ||
-                (UniqueAddress(module, kAdvertisePattern) && UniqueAddress(module, kValidatePattern));
-            if (!knownGates)
-            {
-                LOG_WARN("MFG unlock: unsupported or ambiguous DLSSG {} signatures; left unchanged",
-                         g_status.SnippetVersion);
-                return;
-            }
 
             // Retargeting and both gates form one feature; a count-only unlock repeats frames. One temporal
             // method per session, since both edit the same fatbin.
