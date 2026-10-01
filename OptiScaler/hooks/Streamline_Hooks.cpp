@@ -1107,7 +1107,8 @@ static void RefreshAdaMfgLimit()
     const auto requested = overrideCount.value_for_config();
     // A preliminary provider may have clamped this session to one. Recover the
     // saved request on success; an explicit later UI choice supersedes it.
-    if (overrideCount.has_value() && requested.has_value() && requested.value() > overrideCount.value())
+    if (overrideCount.has_value() && requested.has_value() &&
+        (requested.value() > overrideCount.value() || overrideCount.value() > maximum))
         overrideCount.set_volatile_value(std::min(requested.value(), maximum));
 }
 #endif

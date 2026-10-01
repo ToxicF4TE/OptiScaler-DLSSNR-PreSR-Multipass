@@ -241,6 +241,18 @@ int main(int argc, char** argv) {
 
 
 
+    } else if (name == "initial_override_above_max" || name == "initial_state_override_above_max") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        requested = 6;
+        load(&local);
+        if (name == "initial_state_override_above_max") {
+            QuerySettings();
+            CHECK(State::Instance().dlssgMfgMax == 5 && requested.value() == 5);
+            CHECK(requested.value_for_config_or(-1) == 6);
+        }
+        const auto sent = ApplySettings();
+        CHECK(State::Instance().dlssgMfgMax == 5 && sent == 5 && requested.value() == 5);
+        CHECK(requested.value_for_config_or(-1) == 6 && emittedMode == sl::DLSSGMode::eOn);
     } else if (name == "initial_zero_override" || name == "initial_unset_override") {
         auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
         if (name == "initial_zero_override") requested = 0;
@@ -307,6 +319,7 @@ int main(int argc, char** argv) {
 '''
 
 SCENARIOS = (
+    "initial_override_above_max", "initial_state_override_above_max",
     "initial_zero_override", "initial_unset_override",
     "pending_limit_options", "pending_limit_state", "pending_limit_recovery", "unsupported_limit_recovery",
     "local_then_cached", "cached_then_local", "duplicate_notifications",
