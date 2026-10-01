@@ -1091,6 +1091,23 @@ bool StreamlineHooks::hkcommon_slOnPluginLoad(sl::param::IParameters* params, co
     return result;
 }
 
+static void RefreshAdaMfgLimit()
+{
+    auto& state = State::Instance();
+    const auto maximum = static_cast<int>(MfgUnlock::UnlockedMax());
+    if (maximum <= state.dlssgMfgMax.value_or(0))
+        return;
+
+    state.dlssgMfgMax = maximum;
+    auto& overrideCount = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+    const auto requested = overrideCount.value_for_config();
+    // A preliminary provider may have clamped this session to one. Recover the
+    // saved request on success; an explicit later UI choice supersedes it.
+    if (overrideCount.has_value() && requested.has_value() &&
+        (requested.value() > overrideCount.value() || overrideCount.value() > maximum))
+        overrideCount.set_volatile_value(std::min(requested.value(), maximum));
+}
+
 sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSGOptions& options)
 {
     lastDlssgViewport = viewport;
@@ -1150,14 +1167,10 @@ sl::Result StreamlineHooks::hkslDLSSGSetOptions(const sl::ViewportHandle& viewpo
         // Before the read, so the count this captures is the patched one. Five stays under the
         // sanity bound below.
         MfgUnlock::TryApply();
+        RefreshAdaMfgLimit();
 
-        // nvngx_dlssg.dll can load after this runs, and the ceiling read before it does is Ada's
-        // 1. Caching that holds it for the session and clamps the override to it. ModuleFound
-        // means the patches have been attempted, so from there the answer is final either way.
-        const bool unlockPending = MfgUnlock::Pending();
-
-        // Populate dlssgMfgMax once
-        if (!state.dlssgMfgMax.has_value() && !unlockPending)
+        // Respect the native limit while discovery is pending; a later unlock refreshes it.
+        if (!state.dlssgMfgMax.has_value())
         {
             sl::DLSSGState localState {};
             sl::DLSSGOptions localOptions {};
@@ -1275,13 +1288,11 @@ sl::Result StreamlineHooks::hkslDLSSGGetState(const sl::ViewportHandle& viewport
     }
 
     auto& optiState = State::Instance();
+    RefreshAdaMfgLimit();
 
     if (optiState.streamlineVersion >= feature_version { 2, 7, 1 })
     {
-        // Provisional until the snippet has been seen. See the note in hkslDLSSGSetOptions.
-        const bool unlockPending = MfgUnlock::Pending();
-
-        if (!optiState.dlssgMfgMax.has_value() && !unlockPending)
+        if (!optiState.dlssgMfgMax.has_value())
         {
             sl::DLSSGState localState {};
             sl::DLSSGOptions localOptions {};

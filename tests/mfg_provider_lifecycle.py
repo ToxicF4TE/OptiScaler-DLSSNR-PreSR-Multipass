@@ -19,7 +19,7 @@ import tempfile
 
 def body(source, signature):
     start = source.index(signature)
-    brace = source.index("{", start)
+    brace = source.index("{", start + len(signature))
     depth, end = 1, brace + 1
     while depth:
         depth += (source[end] == "{") - (source[end] == "}")
@@ -32,6 +32,8 @@ STUBS = r'''
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <compare>
+#include <concepts>
 #include <cstdio>
 #include <cwctype>
 #include <filesystem>
@@ -102,12 +104,35 @@ struct Option {
     bool value_or_default() const { return value.value_or(false); }
     bool value_or(bool fallback) const { return value.value_or(fallback); }
 };
+
+// The real CustomOptional implementation is inserted here.
+/* CONFIG_OPTION */
+struct feature_version {
+    int major, minor, patch;
+    auto operator<=>(const feature_version&) const = default;
+};
+namespace sl {
+enum class Result { eOk };
+enum class DLSSGMode { eOff, eOn };
+struct DLSSGOptions { unsigned numFramesToGenerate = 3; DLSSGMode mode = DLSSGMode::eOn; };
+struct DLSSGState { unsigned numFramesToGenerateMax = 1; };
+}
+unsigned nativeCeiling = 1;
+sl::DLSSGMode emittedMode = sl::DLSSGMode::eOn;
+sl::Result o_slDLSSGGetState(int, sl::DLSSGState& state, const sl::DLSSGOptions*) {
+    state.numFramesToGenerateMax = nativeCeiling;
+    return sl::Result::eOk;
+}
+
 struct Config {
+    CustomOptional<int, NoDefault> FGDLSSGOverrideInterpolationCount;
     Option FGDLSSGAdaMfgUnlock{true}, FGDLSSGAmpereMfgUnlock{false};
     Option FGDLSSGAdaBlackwellKernels{};
     static Config* Instance() { static Config config; return &config; }
 };
 struct State {
+    feature_version streamlineVersion{2,14,1};
+    std::optional<int> dlssgMfgMax;
     bool externalFrameGeneration = false;
     std::string NGX_OTA_Dlss, NGX_OTA_Dlssd;
     static State& Instance() { static State state; return state; }
@@ -346,6 +371,55 @@ int main(int argc, char** argv) {
         Load(L"C:\\unrelated\\runtime.bin", &unknown);
         CHECK(local.rewrites == 0 && cached.rewrites == 0 && unknown.rewrites == 0);
         CHECK(!State::Instance().NGX_OTA_Dlss.empty() && !State::Instance().NGX_OTA_Dlssd.empty());
+
+
+
+    } else if (name == "initial_override_above_max" || name == "initial_state_override_above_max" ||
+               name == "initial_zero_override" || name == "initial_unset_override") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        if (name != "initial_unset_override") requested = name == "initial_zero_override" ? 0 : 6;
+        Load(dll, &local);
+        if (name == "initial_state_override_above_max") QuerySettings();
+        const auto sent = ApplySettings();
+        CHECK(State::Instance().dlssgMfgMax == 5);
+        if (name == "initial_unset_override")
+            CHECK(!requested.has_value() && sent == 3 && emittedMode == sl::DLSSGMode::eOn);
+        else if (name == "initial_zero_override")
+            CHECK(requested.value() == 0 && requested.value_for_config_or(-1) == 0 && emittedMode == sl::DLSSGMode::eOff);
+        else CHECK(sent == 5 && requested.value_for_config_or(-1) == 6);
+    } else if (name == "pending_limit_options" || name == "pending_limit_state" ||
+               name == "pending_limit_recovery" || name == "unsupported_limit_recovery") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        requested = 3;
+        if (name != "pending_limit_recovery") Load(dll, &unknown);
+        CHECK(MfgUnlock::Pending());
+        if (name == "pending_limit_state") QuerySettings();
+        else CHECK(ApplySettings() == 1);
+        CHECK(State::Instance().dlssgMfgMax == 1 && requested.value() == 1);
+        CHECK(requested.value_for_config_or(-1) == 3 && MfgUnlock::Pending());
+        if (name == "pending_limit_recovery" || name == "unsupported_limit_recovery") {
+            Load(bin, &cached);
+            nativeCeiling = 5;
+            CHECK(ApplySettings() == 3 && State::Instance().dlssgMfgMax == 5);
+            CHECK(requested.value_for_config_or(-1) == 3);
+        }
+    } else if (name == "provisional_limit_recovery" || name == "state_query_limit_recovery" ||
+               name == "newer_user_override" || name == "newer_user_override_one") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        requested = 3;
+        local.kernelCompatible = false;
+        Load(dll, &local);
+        if (name == "state_query_limit_recovery") QuerySettings();
+        else CHECK(ApplySettings() == 1);
+        CHECK(State::Instance().dlssgMfgMax == 1 && requested.value() == 1);
+        CHECK(requested.value_for_config_or(-1) == 3);
+        const int expected = name == "newer_user_override" ? 2 : name == "newer_user_override_one" ? 1 : 3;
+        if (expected != 3) requested = expected;
+        Load(bin, &cached);
+        nativeCeiling = 5;
+        if (name == "state_query_limit_recovery") QuerySettings();
+        CHECK(ApplySettings() == expected && State::Instance().dlssgMfgMax == 5);
+        CHECK(requested.value_for_config_or(-1) == expected);
     } else return 2;
     std::printf("PASS %s\n", argv[1]);
     return 0;
@@ -353,6 +427,8 @@ int main(int argc, char** argv) {
 '''
 
 SCENARIOS = (
+    "initial_override_above_max", "initial_state_override_above_max", "initial_zero_override", "initial_unset_override",
+    "pending_limit_options", "pending_limit_state", "pending_limit_recovery", "unsupported_limit_recovery",
     "local_then_cached", "cached_then_local", "duplicate_notifications",
     "same_address_reload", "unsupported_after_success", "unsupported_before_supported",
     "unsupported_address_reused", "incompatible_kernels", "kernels_disabled_after_success",
@@ -361,6 +437,7 @@ SCENARIOS = (
     "concurrent_provider_notifications", "concurrent_status_snapshot", "concurrent_unlocked_max",
     "concurrent_pending", "stable_status_snapshot", "metadata_outside_lock", "logging_reentry",
     "polled_module_reference",
+    "provisional_limit_recovery", "state_query_limit_recovery", "newer_user_override", "newer_user_override_one",
 )
 
 
@@ -400,7 +477,26 @@ HMODULE Load(std::wstring libName, HMODULE module) {
     ada = hook[hook.index("// Optional Ada unlock"):]
     code += body(ada, "if (") + "\n"
     code += body(hook, 'if (libName.ends_with(L".bin"))') + "\n"
-    code += "return NtdllProxy::LoadLibraryExW_Ldr(lpLibFullPath, nullptr, 0);\n}\n" + CASES
+    code += "return NtdllProxy::LoadLibraryExW_Ldr(lpLibFullPath, nullptr, 0);\n}\n"
+
+    config = (args.source_root / "OptiScaler/Config.h").read_text(encoding="utf-8-sig")
+    optional = config[config.index("enum HasDefaultValue"):config.index("constexpr inline int UnboundKey")]
+    code = code.replace("/* CONFIG_OPTION */", optional)
+    streamline = (args.source_root / "OptiScaler/hooks/Streamline_Hooks.cpp").read_text(encoding="utf-8-sig")
+    code += "\n#define OPTISCALER_RTX40_MFG 1\n#define LOG_TRACE(...) ((void)0)\n"
+    code += body(streamline, "void RefreshAdaMfgLimit()") + "\n"
+    code += "unsigned ApplySettings() { auto& state = State::Instance(); sl::DLSSGOptions newOptions;\n"
+    code += "const bool dlssgPotentiallyActive = true, enableDynamicMode = false; const int viewport = 0;\n"
+    code += body(streamline, "if (dlssgPotentiallyActive && state.streamlineVersion >= feature_version { 2, 7, 1 })")
+    code += "\nemittedMode = newOptions.mode; return newOptions.numFramesToGenerate; }\n"
+    # Include the actual GetState preamble and caching branch, not a duplicate of its policy.
+    get_state = streamline[streamline.index("sl::Result StreamlineHooks::hkslDLSSGGetState("):]
+    start = get_state.index("auto& optiState = State::Instance();")
+    stop = get_state.index("if (optiState.streamlineVersion >= feature_version { 2, 7, 1 })", start)
+    code += "void QuerySettings() { const int viewport = 0;\n" + get_state[start:stop]
+    code += body(get_state[stop:], "if (optiState.streamlineVersion >= feature_version { 2, 7, 1 })") + "\n}\n"
+
+    code += CASES
     compiler = shutil.which(args.compiler)
     if not compiler:
         parser.error("compiler unavailable; use an x64 Native Tools prompt")
