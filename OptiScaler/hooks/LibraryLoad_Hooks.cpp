@@ -116,7 +116,7 @@ HMODULE LibraryLoadHooks::LoadLibraryCheckW(std::wstring libName, LPCWSTR lpLibF
 #if defined(OPTISCALER_RTX40_MFG)
     // Keep watching provider loads after a local probe has been patched: NGX may
     // subsequently select its OTA provider. TryApply handles duplicates per module.
-    if (MfgUnlock::Provider::IsProviderPath(normalizedPath) && MfgUnlock::EnabledForSession())
+    if (MfgUnlock::Provider::IsProviderPath(normalizedPath) && MfgUnlock::Enabled())
     {
         auto snippet = NtdllProxy::LoadLibraryExW_Ldr(lpLibFullPath, NULL, 0);
         if (snippet)

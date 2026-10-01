@@ -17,7 +17,7 @@ import tempfile
 
 def function(source, signature):
     start = source.index(signature)
-    brace = source.index("{", start)
+    brace = source.index("{", start + len(signature))
     depth, end = 1, brace + 1
     while depth:
         depth += (source[end] == "{") - (source[end] == "}")
@@ -28,17 +28,54 @@ def function(source, signature):
 STUBS = r'''
 #include <algorithm>
 #include <cstdint>
+#include <compare>
+#include <concepts>
 #include <cstdio>
 #include <cwchar>
 #include <mutex>
+#include <optional>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+
+// The real CustomOptional implementation is inserted here.
+/* CONFIG_OPTION */
+struct feature_version {
+    int major, minor, patch;
+    auto operator<=>(const feature_version&) const = default;
+};
+namespace sl {
+enum class Result { eOk };
+enum class DLSSGMode { eOff, eOn };
+struct DLSSGOptions { unsigned numFramesToGenerate = 3; DLSSGMode mode = DLSSGMode::eOn; };
+struct DLSSGState { unsigned numFramesToGenerateMax = 1; };
+}
+unsigned nativeCeiling = 1;
+sl::DLSSGMode emittedMode = sl::DLSSGMode::eOn;
+sl::Result o_slDLSSGGetState(int, sl::DLSSGState& state, const sl::DLSSGOptions*) {
+    state.numFramesToGenerateMax = nativeCeiling;
+    return sl::Result::eOk;
+}
+
+struct Config {
+    CustomOptional<int, NoDefault> FGDLSSGOverrideInterpolationCount;
+    static Config* Instance() { static Config config; return &config; }
+};
+struct State {
+    feature_version streamlineVersion{2,14,1};
+    std::optional<int> dlssgMfgMax;
+    static State& Instance() { static State state; return state; }
+};
+std::function<void()> loggingCallback;
+void LogBoundary() { if (loggingCallback) loggingCallback(); }
 
 struct FakeModule {
     bool supported = true, loaded = true;
     bool advertise = false, validate = false, kernelCompatible = true;
     unsigned rewrites = 0;
+    bool retargeted = false;
     std::string version = "310.9.1";
 };
 using HMODULE = FakeModule*;
@@ -67,10 +104,7 @@ struct GPU {
 GPU gpu;
 const GPU& getPrimaryGpu() { return gpu; }
 }
-bool AdaUnlockWanted() {
-    return session && IdentifyGpu::gpu.vendorId == VendorId::Nvidia &&
-           IdentifyGpu::gpu.nvidiaArchInfo.architecture_id == NV_GPU_ARCHITECTURE_AD100;
-}
+bool AdaUnlockWanted();
 HMODULE FindProvider() { return current; }
 constexpr std::string_view kAdvertisePattern309 = "advertise";
 constexpr std::string_view kValidatePattern309 = "validate";
@@ -91,19 +125,22 @@ std::string wstring_to_string(const wchar_t*) { return "fake.dll"; }
 std::string ModuleVersion(HMODULE m) { return m->version; }
 unsigned RewriteBlackwellKernels(HMODULE m) {
     ++m->rewrites;
-    return m->kernelCompatible ? 31 : 0;
+    const bool compatible = m->kernelCompatible && !m->retargeted;
+    m->retargeted |= compatible;
+    return compatible ? 31 : 0;
 }
 bool PatchAdvertise(HMODULE m) { m->advertise = true; return true; }
 bool PatchValidate(HMODULE m) { m->validate = true; return true; }
-#define LOG_INFO(...) ((void)0)
-#define LOG_WARN(...) ((void)0)
+#define LOG_INFO(...) LogBoundary()
+#define LOG_WARN(...) LogBoundary()
 namespace Ptx {
 struct Result { unsigned redirected = 0; std::string detail; };
 void Apply(HMODULE, Result&) {}
 }
 namespace MfgUnlock {
-void TryApply(HMODULE);
+void TryApply(HMODULE = nullptr);
 bool Pending();
+bool Enabled();
 bool EnabledForSession() { return session; }
 Status LastStatus() { return g_status; }
 TemporalMethod ConfiguredTemporalMethod() { return TemporalMethod::Retarget; }
@@ -137,9 +174,13 @@ int main(int argc, char** argv) {
     cached.version = "310.9.0";
     unknown.supported = false;
     unknown.version = "310.2.1";
+    unsigned interceptedLoads = 0;
     auto load = [&](HMODULE module) {
         current = module;
-        if (LOAD_ELIGIBILITY) MfgUnlock::TryApply(module);
+        if (LOAD_ELIGIBILITY) {
+            ++interceptedLoads;
+            MfgUnlock::TryApply(module);
+        }
     };
     if (name == "local_then_cached") {
         load(&local); CHECK(unlocked(local));
@@ -147,6 +188,7 @@ int main(int argc, char** argv) {
         local.loaded = false;
         load(&cached); CHECK(unlocked(cached));
         CHECK(g_status.SnippetVersion == "310.9.0");
+        CHECK(interceptedLoads == 2);
     } else if (name == "cached_then_local") {
         load(&cached); load(&local);
         CHECK(unlocked(local)); CHECK(unlocked(cached));
@@ -174,12 +216,17 @@ int main(int argc, char** argv) {
     } else if (name == "session_disabled") {
         session = false; load(&local); MfgUnlock::TryApply(&local);
         CHECK(local.rewrites == 0 && !MfgUnlock::Pending());
-    } else if (name == "non_ada") {
-        IdentifyGpu::gpu.nvidiaArchInfo.architecture_id = 2;
+        CHECK(interceptedLoads == 0);
+    } else if (name == "non_ada" || name == "non_ada_ampere" || name == "non_ada_blackwell") {
+        // Distinct non-AD100 architecture IDs stand for RTX 20, 30 and 50 series.
+        IdentifyGpu::gpu.nvidiaArchInfo.architecture_id =
+            name == "non_ada" ? 2 : name == "non_ada_ampere" ? 3 : 4;
         load(&local); CHECK(local.rewrites == 0 && !MfgUnlock::Pending());
+        CHECK(interceptedLoads == 0);
     } else if (name == "non_nvidia") {
         IdentifyGpu::gpu.vendorId = VendorId::Other;
         load(&local); CHECK(local.rewrites == 0 && !MfgUnlock::Pending());
+        CHECK(interceptedLoads == 0);
     } else if (name == "absent_provider") {
         MfgUnlock::TryApply(nullptr); CHECK(MfgUnlock::Pending());
         load(&cached); CHECK(unlocked(cached));
@@ -191,6 +238,68 @@ int main(int argc, char** argv) {
         plugin.loaded = false; g_plugins.push_back(&plugin);
         load(&local); plugin.loaded = true; load(&cached);
         CHECK(pluginScans == 1 && g_status.PluginCeiling == "patched");
+
+
+
+    } else if (name == "initial_zero_override" || name == "initial_unset_override") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        if (name == "initial_zero_override") requested = 0;
+        load(&local);
+        const auto sent = ApplySettings();
+        CHECK(State::Instance().dlssgMfgMax == 5);
+        if (name == "initial_unset_override")
+            CHECK(!requested.has_value() && sent == 3 && emittedMode == sl::DLSSGMode::eOn);
+        else CHECK(requested.value() == 0 && requested.value_for_config_or(-1) == 0 && emittedMode == sl::DLSSGMode::eOff);
+    } else if (name == "pending_limit_options" || name == "pending_limit_state" ||
+               name == "pending_limit_recovery" || name == "unsupported_limit_recovery") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        requested = 3;
+        if (name != "pending_limit_recovery") load(&unknown);
+        CHECK(MfgUnlock::Pending());
+        if (name == "pending_limit_state") QuerySettings();
+        else CHECK(ApplySettings() == 1);
+        CHECK(State::Instance().dlssgMfgMax == 1 && requested.value() == 1);
+        CHECK(requested.value_for_config_or(-1) == 3 && MfgUnlock::Pending());
+        if (name == "pending_limit_recovery" || name == "unsupported_limit_recovery") {
+            load(&cached);
+            nativeCeiling = 5;
+            CHECK(ApplySettings() == 3 && State::Instance().dlssgMfgMax == 5);
+            CHECK(requested.value_for_config_or(-1) == 3);
+        }
+    } else if (name == "provisional_limit_recovery" || name == "state_query_limit_recovery" ||
+               name == "newer_user_override" || name == "newer_user_override_one") {
+        auto& requested = Config::Instance()->FGDLSSGOverrideInterpolationCount;
+        requested = 3;
+        local.kernelCompatible = false;
+        load(&local);
+        if (name == "state_query_limit_recovery") QuerySettings();
+        else CHECK(ApplySettings() == 1);
+        CHECK(State::Instance().dlssgMfgMax == 1 && requested.value() == 1);
+        CHECK(requested.value_for_config_or(-1) == 3);
+        const int expected = name == "newer_user_override" ? 2 : name == "newer_user_override_one" ? 1 : 3;
+        if (expected != 3) requested = expected;
+        load(&cached);
+        nativeCeiling = 5;
+        if (name == "state_query_limit_recovery") QuerySettings();
+        CHECK(ApplySettings() == expected && State::Instance().dlssgMfgMax == 5);
+        CHECK(requested.value_for_config_or(-1) == expected);
+
+    } else if (name == "same_provider_reentry" || name == "nested_provider_status") {
+        bool entered = false, snapshotComplete = false;
+        cached.kernelCompatible = false;
+        loggingCallback = [&] {
+            if (entered) return;
+            entered = true;
+            // No partial attempt should replace the last completed snapshot.
+            snapshotComplete = !MfgUnlock::LastStatus().ModuleFound;
+            MfgUnlock::TryApply(name == "same_provider_reentry" ? &local : &cached);
+        };
+        load(&local);
+        CHECK(entered && snapshotComplete && unlocked(local));
+        CHECK(MfgUnlock::UnlockedMax() == 5 && g_status.SnippetVersion == local.version);
+        CHECK(g_status.AdvertiseMatched && g_status.ValidateMatched && g_status.KernelsRewritten == 31);
+        if (name == "nested_provider_status")
+            CHECK(cached.rewrites == 1 && !cached.advertise && !cached.validate);
     } else return 2;
     std::printf("PASS %s\n", argv[1]);
     return 0;
@@ -198,10 +307,14 @@ int main(int argc, char** argv) {
 '''
 
 SCENARIOS = (
+    "initial_zero_override", "initial_unset_override",
+    "pending_limit_options", "pending_limit_state", "pending_limit_recovery", "unsupported_limit_recovery",
     "local_then_cached", "cached_then_local", "duplicate_notifications",
     "same_address_reload", "unsupported_after_success", "unsupported_before_supported",
     "unsupported_address_reused", "incompatible_kernels", "session_disabled",
-    "non_ada", "non_nvidia", "absent_provider", "stale_plugin", "plugin_loaded_later",
+    "non_ada", "non_ada_ampere", "non_ada_blackwell", "non_nvidia", "absent_provider", "stale_plugin", "plugin_loaded_later",
+    "provisional_limit_recovery", "state_query_limit_recovery", "newer_user_override", "newer_user_override_one",
+    "same_provider_reentry", "nested_provider_status",
 )
 
 
@@ -218,9 +331,29 @@ def main():
     line = next(line for line in hook.splitlines()
                 if "MfgUnlock::Provider::IsProviderPath(normalizedPath) &&" in line)
     eligibility = line.split("&&", 1)[1].strip().rsplit(")", 1)[0]
-    code = STUBS + "\n" + function(unlock, "void PatchPluginCeilings()") + "\n"
+    code = STUBS + "\n" + function(unlock, "bool AdaUnlockWanted()") + "\n"
+    code += function(unlock, "bool MfgUnlock::Enabled()") + "\n"
+    code += function(unlock, "void PatchPluginCeilings()") + "\n"
     code += function(unlock, "void MfgUnlock::TryApply(") + "\n"
     code += function(unlock, "bool MfgUnlock::Pending()") + "\n"
+
+    config = (root / "OptiScaler/Config.h").read_text(encoding="utf-8-sig")
+    optional = config[config.index("enum HasDefaultValue"):config.index("constexpr inline int UnboundKey")]
+    code = code.replace("/* CONFIG_OPTION */", optional)
+    streamline = (root / "OptiScaler/hooks/Streamline_Hooks.cpp").read_text(encoding="utf-8-sig")
+    code += "\n#define OPTISCALER_RTX40_MFG 1\n#define LOG_TRACE(...) ((void)0)\n"
+    code += function(streamline, "void RefreshAdaMfgLimit()") + "\n"
+    code += "unsigned ApplySettings() { auto& state = State::Instance(); sl::DLSSGOptions newOptions;\n"
+    code += "const bool dlssgPotentiallyActive = true, enableDynamicMode = false; const int viewport = 0;\n"
+    code += function(streamline, "if (dlssgPotentiallyActive && state.streamlineVersion >= feature_version { 2, 7, 1 })")
+    code += "\nemittedMode = newOptions.mode; return newOptions.numFramesToGenerate; }\n"
+    # Include the actual GetState preamble and caching branch, not a duplicate of its policy.
+    get_state = streamline[streamline.index("sl::Result StreamlineHooks::hkslDLSSGGetState("):]
+    start = get_state.index("auto& optiState = State::Instance();")
+    stop = get_state.index("if (optiState.streamlineVersion >= feature_version { 2, 7, 1 })", start)
+    code += "void QuerySettings() { const int viewport = 0;\n" + get_state[start:stop]
+    code += function(get_state[stop:], "if (optiState.streamlineVersion >= feature_version { 2, 7, 1 })") + "\n}\n"
+
     code += CASES.replace("LOAD_ELIGIBILITY", eligibility)
     compiler = shutil.which(args.compiler)
     if not compiler:

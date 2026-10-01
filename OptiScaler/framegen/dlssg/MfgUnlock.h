@@ -71,6 +71,9 @@ struct Status
 Status LastStatus();
 bool EnabledForSession();
 
+// Session and GPU eligibility, independent of whether a provider was already patched.
+bool Enabled();
+
 // The method [DLSSG] AdaTemporalFix selects right now: Retarget unless it names Ptx. The overlay compares
 // it with Status::TemporalAttempted to show that a change needs a restart.
 TemporalMethod ConfiguredTemporalMethod();
